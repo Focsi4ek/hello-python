@@ -1,0 +1,153 @@
+name: Python CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Lint and format check
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+
+      - name: Run tests
+        run: python -m pytest -v
+
+  build:
+    needs: test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x64
+            name: hello-python-linux-x64
+            artifact: hello-python-linux-x64
+          - os: macos-14
+            architecture: arm64
+            name: hello-python-macos-arm64
+            artifact: hello-python-macos-arm64
+          - os: windows-2022
+            architecture: x64
+            name: hello-python-windows-x64
+            artifact: hello-python-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.architecture }}
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Embed release version
+        shell: python
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          import os
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          Path("hello/__init__.py").write_text(
+              f"__version__ = {version!r}\n",
+              encoding="utf-8",
+          )
+
+      - name: Build binary
+        env:
+          APP_NAME: ${{ matrix.name }}
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onefile \
+            --name "$APP_NAME" \
+            main.py
+
+      - name: Test built binary
+        shell: python
+        env:
+          BINARY_PATH: dist/${{ matrix.artifact }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+
+          binary = Path(os.environ["BINARY_PATH"]).resolve()
+          result = subprocess.run(
+              [str(binary), "CI"],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              encoding="utf-8",
+          )
+          print(result.stdout, end="")
+          result.check_returncode()
+
+          expected = "hello-python version " + os.environ["RELEASE_VERSION"]
+          if expected not in result.stdout.splitlines():
+              raise RuntimeError("Incorrect binary version")
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/**/hello-python-*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
